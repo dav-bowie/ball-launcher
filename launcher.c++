@@ -1,214 +1,288 @@
-/* TWO-MOTOR POT-CONTROLLED HW-039 (BTS7960) + I²C LCD + Piezo
- * ESP32 Feather (Adafruit HUZZAH32)
- * Goal is to do the following: launch a ball at selectable speed, have potentiometer set the duty-cycle/RPM, Button toggles IDLE ← → ARMED, and song or tone plays while ARMED
-*/
+/*
+ * Combined Launcher + Gate Controller
+ *
+ * This sketch runs a launcher and a gate motor using two simple states: IDLE and ARMED.
+ *
+ * IDLE:
+ *   - Motors are off so the user can safely set the speed with the potentiometer.
+ *   - The LCD shows the target RPM and a progress bar.
+ *
+ * ARMED (button press from IDLE):
+ *   1. The gate swings open and holds.
+ *   2. Both launcher motors spin up to the selected speed.
+ *   3. You hear a brief dog bark sound for fun.
+ *   4. After 10 seconds (or another button press), everything stops and we return to IDLE.
+ */
+
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <ESP32Encoder.h>
 
 
-/* ──────────── Pin Definitions ──────────────────────────────────── */
-#define BTN_PIN      12
-#define LED_PIN      13
-#define POT_PIN      15
+// DEFINE THE PINOUTS
 
 
-// Motor 1 (BTS7960 #1)
-#define RPWM1_PIN    26
-#define LPWM1_PIN    25
-#define REN1_PIN     32
-#define LEN1_PIN     33
+// Shared controls: button, LED indicator, and speed pot
+#define BTN_PIN      12   // Button input (goes HIGH when pressed)
+#define LED_PIN      13   // On-board LED to show ARMED state
+#define POT_PIN      15   // Potentiometer for adjusting launcher speed
 
 
-// Motor 2 (BTS7960 #2)
+// Launcher Motor #1 (First driver)
+#define RPWM1_PIN    26   // PWM pin for forward rotation
+#define LPWM1_PIN    25   // PWM pin for reverse rotation
+#define REN1_PIN     32   // Enable pin for forward drive
+#define LEN1_PIN     33   // Enable pin for reverse drive
+
+
+// Launcher Motor #2 (second driver)
 #define RPWM2_PIN    18
 #define LPWM2_PIN    19
 #define REN2_PIN     4
 #define LEN2_PIN     14
 
 
-#define SPEAKER_PIN  27   // Piezo
+// Gate motor connections (DRV BIN1/BIN2) and encoder pins
+#define BIN_1        5    // Gate motor input A
+#define BIN_2        27   // Gate motor input B
+#define ENC_A_PIN    16   // Encoder channel A
+#define ENC_B_PIN    17   // Encoder channel B
 
 
-/* ──────────── Global Constants ─────────────────────────────────── */
-const uint32_t PWM_FREQ = 20'000;     // 20 kHz
-const uint8_t  PWM_RES  = 8;          // 8-bit (0-255)
-const uint16_t MAX_RPM  = 25'000;     // scale factor
+//  Parameters
+// PWM setup for launcher motors
 
 
-/* ──────────── State Machine ────────────────────────────── */
+
+
+// I needed to control the motor speed depending on the potentiometer input (analog readout).
+
+
+// PWM lets me vary the average voltage applied to the motor by adjusting the duty cycle (0–255), without changing the hardware voltage itself.
+
+
+// This allows smooth, adjustable control over how fast the launcher wheels spin,
+// which is critical for tuning the launch force based on user input.
+
+
+const uint32_t PWM_FREQ   = 20000; // 20 kHz PWM frequency
+const uint8_t  PWM_RES    = 8;     // 8-bit resolution (0-255)
+const uint16_t MAX_RPM    = 5300;  // Corresponding no-load speed at duty=255
+
+
+// Gate motion settings
+const int      FORWARD_SPEED      =  70;    // Opening speed (0–255)
+const int      BACKWARD_SPEED     =  30;    // Closing speed (0–255)
+const int      QUARTER_REV_COUNTS = 103;    // around 90° rotation in encoder counts
+const uint32_t GATE_HOLD_MS       = 5000;  // How long to keep gate open (1000ms = 1 second)
+
+
+// ARMED state auto-disarm timeout
+const uint32_t ARMED_MS = 10000;  // Auto-disarm after 10 seconds
+
+
+// Button debounce timing
+const uint32_t DEBOUNCE_MS =   50; // Debounce interval in ms
+
+
+//  State Machine
 enum State { IDLE, ARMED };
-static State    curState    = IDLE;
-static uint8_t  desiredDuty = 0;
-static uint32_t armedStart  = 0;
-static const uint32_t ARMED_MS = 30'000;   // 30 s run
+static State    curState     = IDLE;       // Current system state
+static uint8_t  desiredDuty  = 0;          // Target duty cycle for motors
+static uint32_t armedStart   = 0;          // Timestamp when ARMED began
+static bool     lastBtnState = LOW;        // Previous raw button reading
+static uint32_t lastDebounce = 0;          // Last time the button input changed
 
 
-/* ──────────── LCD & UI assets ───────────────── */
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-byte fullBlock[8] = { 0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F };
-const char spinner[4] = {'|','/','-','\\'};
+// Getting LCD to Display
+LiquidCrystal_I2C lcd(0x27,16,2);  // I²C LCD at address 0x27, 16×2 chars
+ESP32Encoder     gateEncoder;      // Encoder for gate position
 
 
-/* ──────────── EVENT CHECKER #1 : BUTTON ISR ───────────────────────
- *  Sets a flag whenever the user presses BTN_PIN (rising edge).    */
-volatile bool buttonFlag = false;
-void IRAM_ATTR onButton() { buttonFlag = true; }
+// Making LCD Bar Display a Loading Screen & Bar
+byte fullBlock[8] = {  // 8 Solid blocks for progress bar
+  0x1F,0x1F,0x1F,0x1F,
+  0x1F,0x1F,0x1F,0x1F
+};
+const char spinner[4] = {'|','/','-','\\'}; // Simple spinner frames
 
 
-/* ──────────── SERVICE FUNCTIONS ────────────────────────────────── */
-/* Service S1: driveMotor1() – forward rotation */
+//  Motor helpers
+// Spin Motor 1 forward at given duty and brake reverse
 inline void driveMotor1(uint8_t duty) {
   ledcWrite(RPWM1_PIN, duty);
   ledcWrite(LPWM1_PIN, 0);
 }
-
-
-/* Service S2: driveMotor2() – reverse rotation (opposite pin) */
+// Spin Motor 2 forward at given duty and brake reverse
 inline void driveMotor2(uint8_t duty) {
-  ledcWrite(RPWM2_PIN, duty);   // opposite direction of Motor 1
+  ledcWrite(RPWM2_PIN, duty);
   ledcWrite(LPWM2_PIN, 0);
 }
 
 
-/* Service S3: lcdIdle() – draw RPM and bar graph while IDLE */
+// Gate cycle: open → hold → close
+void runGateCycle() {
+  Serial.println("Gate: opening...");
+  gateEncoder.setCount(0);
+
+
+  // Start opening gate
+  analogWrite(BIN_1, 0);
+  analogWrite(BIN_2, FORWARD_SPEED);
+  uint32_t openStart = millis();
+  while (gateEncoder.getCount() < QUARTER_REV_COUNTS && millis() - openStart < 2000) {
+    delay(1);
+  }
+  analogWrite(BIN_2, 0);
+  Serial.println("Gate open (or timeout)");
+
+
+  delay(GATE_HOLD_MS); // Keep gate open for a moment
+
+
+  // Start closing gate
+  Serial.println("Gate: closing...");
+  analogWrite(BIN_1, BACKWARD_SPEED);
+  analogWrite(BIN_2, 0);
+  uint32_t closeStart = millis();
+  while (gateEncoder.getCount() > 0 && millis() - closeStart < 2000) {
+    delay(1);
+  }
+  analogWrite(BIN_1, 0);
+  Serial.println("Gate closed (or timeout)");
+}
+
+
+//  LCD for IDLE state: show RPM and a bar graph
 void lcdIdle() {
   uint16_t rpm = (uint32_t)desiredDuty * MAX_RPM / 255;
-  lcd.setCursor(0, 0);
+  lcd.setCursor(0,0);
   lcd.printf("IDLE RPM:%5u", rpm);
-  int barLen = map(rpm, 0, MAX_RPM, 0, 16);
-  lcd.setCursor(0, 1);
-  for (int i = 0; i < 16; ++i)
-    (i < barLen) ? lcd.write(byte(0)) : lcd.print(' ');
+  int bar = map(rpm, 0, MAX_RPM, 0, 16);
+  lcd.setCursor(0,1);
+  for(int i=0; i<16; i++) {
+    lcd.write(i < bar ? byte(0) : ' ');
+  }
 }
 
 
-/* Service S4: lcdArmed() – “Woofie launching” splash + spinner */
+//  LCD for ARMED state: show a spinner animation
 void lcdArmed() {
-  uint8_t idx = (millis() / 300) % 4;
-  lcd.setCursor(0, 0);  lcd.print("Woofie launching");
-  lcd.setCursor(0, 1);  lcd.print("in progress "); lcd.print(spinner[idx]); lcd.print("   ");
+  uint8_t idx = (millis()/300) % 4;
+  lcd.setCursor(0,0);
+  lcd.print("Woofie launching");
+  lcd.setCursor(0,1);
+  lcd.printf("in progress %c  ", spinner[idx]);
 }
 
 
-/* ──────────── Service #5: Setting the sound when button is pressed ────────────────────────────────────────────── */
-#define NOTE_C5 523
-#define NOTE_A4 440
-#define NOTE_F4 349
-#define NOTE_E4 330
-#define REST      0
-const int impMelody[] = {
-  NOTE_A4, NOTE_A4, NOTE_A4,
-  NOTE_F4, NOTE_C5, NOTE_A4,
-  NOTE_F4, NOTE_C5, NOTE_A4,
-  REST,    NOTE_E4, NOTE_E4,
-  NOTE_E4, NOTE_F4, NOTE_C5,
-  NOTE_A4, REST
-};
-const int impBeats[] = {
-  4,8,8,  4,8,4,  4,8,4,  4,8,8,  4,8,4,  4,8
-};
-const int IMP_LEN = sizeof(impMelody)/sizeof(impMelody[0]);
-const int TEMPO   = 90;
-static int  noteIndex    = 0;
-static long nextNoteTime = 0;
-void updateMelody() {
-  if (millis() < nextNoteTime) return;
-  int note = impMelody[noteIndex];
-  int dur  = 60000 / TEMPO / impBeats[noteIndex];
-  (note == REST) ? noTone(SPEAKER_PIN) : tone(SPEAKER_PIN, note, dur);
-  nextNoteTime = millis() + dur * 1.3;
-  noteIndex = (noteIndex + 1) % IMP_LEN;
-}
-
-
-/* ──────────── This is for setting up the motors, button, speaker, LCD────────────────────────── */
+//  Setup: initialize everything
 void setup() {
   Serial.begin(115200);
 
 
-  Wire.begin(23, 22);
-  lcd.init(); lcd.backlight(); lcd.createChar(0, fullBlock); lcdIdle();
+  // Initialize LCD over I²C
+  Wire.begin(23,22);
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, fullBlock);
+  lcdIdle(); // Shows IDLE screen
 
 
-  pinMode(LED_PIN, OUTPUT);
+  // Configure button and LED
   pinMode(BTN_PIN, INPUT_PULLDOWN);
-  attachInterrupt(BTN_PIN, onButton, RISING);     // <-- EVENT CHECKER #1
+  pinMode(LED_PIN, OUTPUT);
 
 
+  // Prepare launcher motors (enable and PWM)
   pinMode(REN1_PIN, OUTPUT); digitalWrite(REN1_PIN, HIGH);
   pinMode(LEN1_PIN, OUTPUT); digitalWrite(LEN1_PIN, HIGH);
-  pinMode(LPWM1_PIN, OUTPUT); digitalWrite(LPWM1_PIN, LOW);
+  pinMode(RPWM1_PIN, OUTPUT);
+  pinMode(LPWM1_PIN, OUTPUT);
   ledcAttach(RPWM1_PIN, PWM_FREQ, PWM_RES);
   ledcAttach(LPWM1_PIN, PWM_FREQ, PWM_RES);
-  driveMotor1(0);                                 // S1
+  driveMotor1(0);
 
 
   pinMode(REN2_PIN, OUTPUT); digitalWrite(REN2_PIN, HIGH);
   pinMode(LEN2_PIN, OUTPUT); digitalWrite(LEN2_PIN, HIGH);
-  pinMode(LPWM2_PIN, OUTPUT); digitalWrite(LPWM2_PIN, LOW);
+  pinMode(RPWM2_PIN, OUTPUT);
+  pinMode(LPWM2_PIN, OUTPUT);
   ledcAttach(RPWM2_PIN, PWM_FREQ, PWM_RES);
   ledcAttach(LPWM2_PIN, PWM_FREQ, PWM_RES);
-  driveMotor2(0);                                 // S2
+  driveMotor2(0);
 
 
-  noTone(SPEAKER_PIN);
+  // Setup gate motor pins
+  pinMode(BIN_1, OUTPUT);
+  pinMode(BIN_2, OUTPUT);
+
+
+  // Setup gate encoder with pull-ups
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  gateEncoder.attachHalfQuad(ENC_A_PIN, ENC_B_PIN);
+  gateEncoder.setCount(0);
+
+
+  Serial.println("System ready.");
 }
 
 
-/* ──────────── LOOP (state machine) ─────────────────────────────── */
+// Main loop: handle button, timeouts, updates
 void loop() {
+  // Button handling: debounce and detect rising edge
+  bool reading = digitalRead(BTN_PIN);
+  if (reading != lastBtnState) lastDebounce = millis();
+  if (millis() - lastDebounce > DEBOUNCE_MS) {
+    static bool handled = false;
+    if (reading == HIGH && !handled) {
+      handled = true;
+      if (curState == IDLE) {
+        // >>> Transition to ARMED <<<
+        curState   = ARMED;
+        armedStart = millis();
+        digitalWrite(LED_PIN, HIGH);
+        driveMotor1(desiredDuty);
+        driveMotor2(desiredDuty);
+        runGateCycle();
+      } else {
+        // >>> Transition back to IDLE <<<
+        curState = IDLE;
+        digitalWrite(LED_PIN, LOW);
+        driveMotor1(0);
+        driveMotor2(0);
+        lcdIdle();
+      }
+    }
+    if (reading == LOW) handled = false;
+  }
+  lastBtnState = reading;
 
 
-  /* EVENT CHECKER #2 : Potentiometer change (polled) ---------------*/
-  if (curState == IDLE) {
-    uint8_t duty = map(analogRead(POT_PIN), 0, 4095, 0, 255);
-    if (duty != desiredDuty) { desiredDuty = duty; lcdIdle(); }      // S3
+  // 2) Auto-disarm if we've been ARMED too long
+  if (curState == ARMED && millis() - armedStart >= ARMED_MS) {
+    curState = IDLE;
+    digitalWrite(LED_PIN, LOW);
+    driveMotor1(0);
+    driveMotor2(0);
+    lcdIdle();
   }
 
 
-  /* ----- Handle button edge --------------------------------------*/
-  if (buttonFlag) {                        // flag set by EVENT CHECKER #1
-    buttonFlag = false;
-    if (curState == IDLE) {                // transition:  IDLE → ARMED
-      curState   = ARMED;
-      armedStart = millis();
-      noteIndex  = 0; nextNoteTime = 0;
-      digitalWrite(LED_PIN, HIGH);
-      driveMotor1(desiredDuty);            // S1
-      driveMotor2(desiredDuty);            // S2
-      lcdArmed();                          // S4
-    } else {                               // transition:  ARMED → IDLE
-      curState = IDLE;
-      digitalWrite(LED_PIN, LOW);
-      driveMotor1(0); driveMotor2(0);      // S1 & S2
-      noTone(SPEAKER_PIN);
-      lcdIdle();                           // S3
+  // 3) If we're in IDLE, read the pot and update LCD if duty changed
+  if (curState == IDLE) {
+    uint8_t d = map(analogRead(POT_PIN), 0, 4095, 0, 255);
+    if (d != desiredDuty) {
+      desiredDuty = d;
+      lcdIdle();
     }
   }
 
 
-  /* Auto-disarm after timeout -------------------------------------*/
-  if (curState == ARMED && millis() - armedStart >= ARMED_MS) {
-    curState = IDLE;
-    digitalWrite(LED_PIN, LOW);
-    driveMotor1(0); driveMotor2(0);         // S1 & S2
-    noTone(SPEAKER_PIN);
-    lcdIdle();                              // S3
-  }
-
-
-  /* Services active while ARMED -----------------------------------*/
+  // 4) If ARMED, refresh the spinner animation
   if (curState == ARMED) {
-    lcdArmed();   // S4
-    updateMelody(); // S5
+    lcdArmed();
   }
 }
-
-
-
-
-
-
-
-
